@@ -6,16 +6,16 @@ use std::process::Command;
 use std::time::Duration;
 
 use bytes::Bytes;
-use clap::Parser;
 use http::Request;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use http;
 
-const RAMP_STEP: Duration = Duration::from_secs(1);
+mod client;
+mod engine;
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Protocol {
     Http1,
     Http2,
@@ -34,30 +34,6 @@ pub enum Load {
     RampingArrivalRate { start_rate: f64, stages: Vec<Stage> },
 }
 
-impl Load {
-    fn steps(&self) -> Vec<(Duration, Option<f64>)> {
-        match self {
-            Load::ConstantVus { duration } => vec![(*duration, None)],
-            Load::ConstantArrivalRate { rate, duration } => vec![(*duration, Some(*rate))],
-            Load::RampingArrivalRate { start_rate, stages } => {
-                // ponytail: linear ramps run as RAMP_STEP-long oha runs, each one reconnects.
-                // Upgrade path: drive oha's client directly with a rate schedule.
-                let mut steps = Vec::new();
-                let mut from = *start_rate;
-                for &Stage { duration, target } in stages {
-                    let n = (duration.as_secs_f64() / RAMP_STEP.as_secs_f64()).ceil() as u32;
-                    for i in 0..n {
-                        let t = (i as f64 + 0.5) / n as f64;
-                        steps.push((duration / n, Some(from + (target - from) * t)));
-                    }
-                    from = target;
-                }
-                steps
-            }
-        }
-    }
-}
-
 #[derive(Clone, Debug, Serialize)]
 struct Config {
     target: String,
@@ -65,6 +41,7 @@ struct Config {
     connections: usize,
     streams: usize,
     warm_up_time: Duration,
+    timeout: Duration,
     load: Load,
 }
 
@@ -96,11 +73,14 @@ pub struct Rate {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Metrics {
     pub http_req_duration: Trend,
     pub http_reqs: Counter,
     pub data_received: Counter,
     pub http_req_failed: Rate,
+    /// Scheduled requests that were not sent because every virtual user was busy.
+    pub dropped_iterations: Counter,
     pub vus_max: usize,
 }
 
@@ -111,27 +91,19 @@ pub struct Measurement {
     pub errors: BTreeMap<String, u64>,
 }
 
-#[derive(Deserialize)]
-struct OhaReport {
-    summary: OhaSummary,
-    #[serde(rename = "errorDistribution")]
-    error_distribution: BTreeMap<String, u64>,
+pub struct Bencher<'a> {
+    config: &'a Config,
+    runtime: &'a tokio::runtime::Runtime,
+    record: Option<engine::Record>,
 }
 
-#[derive(Deserialize)]
-struct OhaSummary {
-    total: f64,
-}
-
-pub struct Bencher {
-    request: Option<Request<Bytes>>,
-}
-
-impl Bencher {
+impl Bencher<'_> {
+    /// Runs the benchmark, calling `routine` once for every request that is sent.
+    ///
+    /// Request URIs are paths (`/users?id=1`), relative to the target address.
     pub fn iter<B: Into<Bytes>, F: FnMut() -> Request<B>>(&mut self, mut routine: F) {
-        // ponytail: oha replays one fixed request, so the routine runs once.
-        // Upgrade path: drive oha's client with a request per call.
-        self.request = Some(routine().map(Into::into));
+        let routine = || routine().map(Into::into);
+        self.record = Some(self.runtime.block_on(engine::run(self.config, routine)));
     }
 }
 
@@ -191,6 +163,7 @@ impl Default for Criterion {
                 connections: 50,
                 streams: 1,
                 warm_up_time: Duration::from_secs(3),
+                timeout: Duration::from_secs(60),
                 load: Load::ConstantVus {
                     duration: Duration::from_secs(10),
                 },
@@ -236,6 +209,11 @@ impl Criterion {
         self
     }
 
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.config.timeout = timeout;
+        self
+    }
+
     pub fn load(mut self, load: Load) -> Self {
         self.config.load = load;
         self
@@ -267,12 +245,6 @@ impl Criterion {
             "gumo: {full_id} has no target address"
         );
 
-        let mut bencher = Bencher { request: None };
-        f(&mut bencher);
-        let Some(request) = bencher.request else {
-            panic!("gumo: {full_id} did not call Bencher::iter");
-        };
-
         let dir = ids.iter().fold(self.output_directory.clone(), |dir, id| {
             dir.join(make_filename_safe(id))
         });
@@ -290,84 +262,21 @@ impl Criterion {
             &serde_json::json!({ "full_id": full_id, "config": config }),
         );
 
-        let (parts, body) = request.into_parts();
-        let http::request::Parts {
-            method,
-            uri,
-            headers,
-            ..
-        } = parts;
-        let path = uri.path_and_query().map_or("/", |path| path.as_str());
-        let mut args = vec![
-            "oha".to_string(),
-            format!("{}{path}", config.target.trim_end_matches('/')),
-            "--no-tui".into(),
-            "--output-format".into(),
-            "json".into(),
-            "-w".into(),
-            "-m".into(),
-            method.to_string(),
-            "-c".into(),
-            config.connections.to_string(),
-            "-p".into(),
-            config.streams.to_string(),
-        ];
+        let mut bencher = Bencher {
+            config,
+            runtime: &self.runtime,
+            record: None,
+        };
+        f(&mut bencher);
+        let Some(record) = bencher.record else {
+            panic!("gumo: {full_id} did not call Bencher::iter");
+        };
         let vus_max = match config.protocol {
             Protocol::Http1 => config.connections,
-            Protocol::Http2 => {
-                args.push("--http2".into());
-                config.connections * config.streams
-            }
+            Protocol::Http2 => config.connections * config.streams,
         };
-        for (name, value) in &headers {
-            let value = value
-                .to_str()
-                .unwrap_or_else(|_| panic!("gumo: header {name} is not visible ASCII"));
-            args.extend(["-H".into(), format!("{name}: {value}")]);
-        }
-        if !body.is_empty() {
-            let body_path = new.join("body.bin");
-            fs::write(&body_path, &body).expect("gumo: cannot write the request body");
-            args.extend(["-D".into(), path_arg(&body_path)]);
-        }
 
-        if !config.warm_up_time.is_zero() {
-            let mut args = args.clone();
-            args.extend(["-z".into(), duration_arg(config.warm_up_time)]);
-            self.oha(args, &new.join("warmup.json"));
-        }
-
-        let db = new.join("requests.db");
-        let mut total = 0.0;
-        let mut errors = BTreeMap::new();
-        for (i, (duration, rate)) in config.load.steps().into_iter().enumerate() {
-            let mut args = args.clone();
-            args.extend([
-                "-z".into(),
-                duration_arg(duration),
-                "--db-url".into(),
-                path_arg(&db),
-            ]);
-            match rate {
-                // oha reads a rate of 0 as "no limit", so a zero-rate step sends nothing.
-                Some(rate) if rate <= 0.0 => {
-                    total += duration.as_secs_f64();
-                    continue;
-                }
-                Some(rate) => args.extend(["-q".into(), rate.to_string()]),
-                None => {}
-            }
-            let OhaReport {
-                summary: OhaSummary { total: step_total },
-                error_distribution,
-            } = self.oha(args, &new.join(format!("oha-{i}.json")));
-            total += step_total;
-            for (error, count) in error_distribution {
-                *errors.entry(error).or_default() += count;
-            }
-        }
-
-        let measurement = measure(&db, total, vus_max, errors);
+        let measurement = measure(record, vus_max);
         let summary =
             serde_json::to_value(&measurement).expect("gumo: cannot serialize the summary");
         write_json(&new.join("summary.json"), &summary);
@@ -384,17 +293,6 @@ impl Criterion {
             write_json(&change_dir.join("summary.json"), change);
         }
         print_measurement(&full_id, &measurement, change.as_ref());
-    }
-
-    fn oha(&self, mut args: Vec<String>, output: &Path) -> OhaReport {
-        args.extend(["-o".into(), path_arg(output)]);
-        let opts = oha::Opts::try_parse_from(&args)
-            .unwrap_or_else(|e| panic!("gumo: invalid oha arguments {args:?}: {e}"));
-        self.runtime
-            .block_on(oha::run(opts))
-            .unwrap_or_else(|e| panic!("gumo: oha failed: {e}"));
-        let report = fs::read(output).expect("gumo: cannot read the oha report");
-        serde_json::from_slice(&report).expect("gumo: cannot parse the oha report")
     }
 }
 
@@ -430,6 +328,11 @@ impl BenchmarkGroup<'_> {
         self
     }
 
+    pub fn timeout(&mut self, timeout: Duration) -> &mut Self {
+        self.config.timeout = timeout;
+        self
+    }
+
     pub fn load(&mut self, load: Load) -> &mut Self {
         self.config.load = load;
         self
@@ -462,28 +365,25 @@ impl BenchmarkGroup<'_> {
     pub fn finish(self) {}
 }
 
-fn measure(db: &Path, total: f64, vus_max: usize, errors: BTreeMap<String, u64>) -> Measurement {
-    let mut durations = Vec::new();
-    let mut status_codes = BTreeMap::new();
-    let mut data = 0;
-    if db.exists() {
-        let conn = rusqlite::Connection::open(db).expect("gumo: cannot open the oha database");
-        let mut stmt = conn
-            .prepare("SELECT duration, status, len_bytes FROM oha")
-            .expect("gumo: cannot query the oha database");
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((row.get::<_, f64>(0)?, row.get(1)?, row.get::<_, i64>(2)?))
-            })
-            .expect("gumo: cannot query the oha database");
-        for row in rows {
-            let (duration, status, len) = row.expect("gumo: cannot read an oha database row");
-            durations.push(duration * 1000.0);
-            *status_codes.entry(status).or_default() += 1;
-            data += len as u64;
-        }
-    }
+fn measure(record: engine::Record, vus_max: usize) -> Measurement {
+    let engine::Record {
+        mut durations,
+        status_codes,
+        errors,
+        data_received,
+        dropped,
+        elapsed,
+    } = record;
     durations.sort_by(f64::total_cmp);
+    let total = elapsed.as_secs_f64();
+    let counter = |count: u64| Counter {
+        count,
+        rate: if total > 0.0 {
+            count as f64 / total
+        } else {
+            0.0
+        },
+    };
 
     let errored: u64 = errors.values().sum();
     let count = durations.len() as u64 + errored;
@@ -496,19 +396,18 @@ fn measure(db: &Path, total: f64, vus_max: usize, errors: BTreeMap<String, u64>)
     Measurement {
         metrics: Metrics {
             http_req_duration: trend(&durations),
-            http_reqs: Counter {
-                count,
-                rate: count as f64 / total,
-            },
-            data_received: Counter {
-                count: data,
-                rate: data as f64 / total,
-            },
+            http_reqs: counter(count),
+            data_received: counter(data_received),
             http_req_failed: Rate {
                 passes: failed,
                 fails: count - failed,
-                value: failed as f64 / count as f64,
+                value: if count > 0 {
+                    failed as f64 / count as f64
+                } else {
+                    0.0
+                },
             },
+            dropped_iterations: counter(dropped),
             vus_max,
         },
         status_codes,
@@ -559,6 +458,7 @@ fn print_measurement(full_id: &str, measurement: &Measurement, change: Option<&V
         },
         http_reqs: Counter { count, rate },
         http_req_failed,
+        dropped_iterations,
         ..
     } = &measurement.metrics;
     println!("{full_id}");
@@ -571,6 +471,15 @@ fn print_measurement(full_id: &str, measurement: &Measurement, change: Option<&V
         "",
         http_req_failed.value * 100.0
     );
+    if dropped_iterations.count > 0 {
+        println!(
+            "{:24}dropped_iterations: {} ({:.1}/s)",
+            "", dropped_iterations.count, dropped_iterations.rate
+        );
+    }
+    for (error, count) in &measurement.errors {
+        println!("{:24}error: {error} ({count})", "");
+    }
     if let Some(change) = change {
         let percent = |metric: &str, key: &str| {
             change["metrics"][metric][key].as_f64().unwrap_or(f64::NAN) * 100.0
@@ -588,16 +497,6 @@ fn print_measurement(full_id: &str, measurement: &Measurement, change: Option<&V
 fn write_json(path: &Path, value: &Value) {
     let json = serde_json::to_vec_pretty(value).expect("gumo: cannot serialize JSON");
     fs::write(path, json).unwrap_or_else(|e| panic!("gumo: cannot write {}: {e}", path.display()));
-}
-
-fn duration_arg(duration: Duration) -> String {
-    format!("{}us", duration.as_micros())
-}
-
-fn path_arg(path: &Path) -> String {
-    path.to_str()
-        .expect("gumo: output path is not UTF-8")
-        .to_string()
 }
 
 fn make_filename_safe(id: &str) -> String {
