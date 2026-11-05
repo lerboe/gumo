@@ -3,6 +3,9 @@ name = "gumo"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["example"]
+
 [dependencies]
 bytes = "1"
 http = "1"
