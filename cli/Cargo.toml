@@ -1,0 +1,14 @@
+[package]
+name = "gumo-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Ramps up the request rate against a URL and plots latency against throughput, live"
+
+[[bin]]
+name = "gumo"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+gumo = { path = "..", version = "0.1.0" }
+ratatui = "0.30"

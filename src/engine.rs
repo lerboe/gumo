@@ -1,7 +1,7 @@
 //! Load generation: drives virtual users according to the configured load.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc as std_mpsc};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep_until};
 
 use crate::client::{Client, Outcome, Target};
-use crate::{Config, Load, Protocol, Stage};
+use crate::{Config, Load, Protocol, Sample, SampleOutcome, Stage};
 
 /// Everything recorded during one measured phase.
 #[derive(Default)]
@@ -60,11 +60,18 @@ struct Ramp {
     to: f64,
 }
 
-pub(crate) async fn run<F: FnMut() -> Request<Bytes>>(config: &Config, routine: F) -> Record {
+/// Runs the warm-up and the measured phase, reporting every request of the measured phase to
+/// `observer` as it completes.
+pub(crate) async fn run<F: FnMut() -> Request<Bytes>>(
+    config: &Config,
+    routine: F,
+    observer: Option<std_mpsc::Sender<Sample>>,
+) -> Record {
     let mut engine = Engine::start(config, routine).await;
     if !config.warm_up_time.is_zero() {
         engine.phase(Phase::Closed, config.warm_up_time).await;
     }
+    engine.observer = observer;
     let (phase, duration) = match &config.load {
         Load::ConstantVus { duration } => (Phase::Closed, *duration),
         Load::ConstantArrivalRate { rate, duration } => (
@@ -104,8 +111,13 @@ struct Engine<'a, F> {
     /// One request channel per virtual user.
     vus: Vec<mpsc::Sender<Request<Full<Bytes>>>>,
     idle: VecDeque<usize>,
+    /// When each virtual user was handed its current request.
+    sent: Vec<Instant>,
     done: mpsc::UnboundedReceiver<Done>,
     config: &'a Config,
+    observer: Option<std_mpsc::Sender<Sample>>,
+    /// Start of the current phase; samples are reported relative to it.
+    phase_start: Instant,
 }
 
 impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
@@ -135,9 +147,12 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
             target,
             routine,
             idle: VecDeque::with_capacity(vus.len()),
+            sent: vec![Instant::now(); vus.len()],
             vus,
             done,
             config,
+            observer: None,
+            phase_start: Instant::now(),
         };
         while engine.idle.len() < engine.vus.len() {
             let Done { vu, outcome } = engine.recv().await;
@@ -158,9 +173,33 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
 
     fn handle(&mut self, done: Done, record: &mut Record) {
         if let Some(outcome) = done.outcome {
+            if self.observer.is_some() {
+                let outcome = match &outcome.result {
+                    Ok(response) => SampleOutcome::Response {
+                        status: response.status,
+                        duration: outcome.duration,
+                    },
+                    Err(error) => SampleOutcome::Error(error.clone()),
+                };
+                self.observe(self.sent[done.vu], outcome);
+            }
             record.add(outcome);
         }
         self.idle.push_back(done.vu);
+    }
+
+    fn observe(&mut self, at: Instant, outcome: SampleOutcome) {
+        let Some(observer) = &self.observer else {
+            return;
+        };
+        let sample = Sample {
+            offset: at.saturating_duration_since(self.phase_start),
+            outcome,
+        };
+        if observer.send(sample).is_err() {
+            // Nobody is listening anymore.
+            self.observer = None;
+        }
     }
 
     /// Hands the next request to an idle virtual user, if there is one.
@@ -169,6 +208,7 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
             return false;
         };
         let request = self.target.prepare((self.routine)());
+        self.sent[vu] = Instant::now();
         self.vus[vu]
             .try_send(request)
             .expect("gumo: an idle virtual user is not ready");
@@ -178,6 +218,7 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
     async fn phase(&mut self, phase: Phase, duration: Duration) -> Record {
         let mut record = Record::default();
         let start = Instant::now();
+        self.phase_start = start;
         let deadline = start + duration;
         match phase {
             Phase::Closed => loop {
@@ -205,6 +246,7 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
                     }
                     if !self.dispatch() {
                         record.dropped += 1;
+                        self.observe(start + offset, SampleOutcome::Dropped);
                     }
                 }
                 let sleep = sleep_until(deadline);

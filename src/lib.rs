@@ -3,6 +3,7 @@ use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -43,6 +44,15 @@ struct Config {
     warm_up_time: Duration,
     timeout: Duration,
     load: Load,
+}
+
+impl Config {
+    fn vus_max(&self) -> usize {
+        match self.protocol {
+            Protocol::Http1 => self.connections,
+            Protocol::Http2 => self.connections * self.streams,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -91,6 +101,26 @@ pub struct Measurement {
     pub errors: BTreeMap<String, u64>,
 }
 
+/// One request of the measured phase, reported live by [`Criterion::measure`].
+#[derive(Clone, Debug)]
+pub struct Sample {
+    /// When the request was sent (or, if dropped, scheduled), relative to the start of the
+    /// measured phase.
+    pub offset: Duration,
+    pub outcome: SampleOutcome,
+}
+
+#[derive(Clone, Debug)]
+pub enum SampleOutcome {
+    Response {
+        status: u16,
+        duration: Duration,
+    },
+    Error(String),
+    /// The request was not sent because every virtual user was busy.
+    Dropped,
+}
+
 pub struct Bencher<'a> {
     config: &'a Config,
     runtime: &'a tokio::runtime::Runtime,
@@ -103,7 +133,10 @@ impl Bencher<'_> {
     /// Request URIs are paths (`/users?id=1`), relative to the target address.
     pub fn iter<B: Into<Bytes>, F: FnMut() -> Request<B>>(&mut self, mut routine: F) {
         let routine = || routine().map(Into::into);
-        self.record = Some(self.runtime.block_on(engine::run(self.config, routine)));
+        self.record = Some(
+            self.runtime
+                .block_on(engine::run(self.config, routine, None)),
+        );
     }
 }
 
@@ -233,6 +266,22 @@ impl Criterion {
         self
     }
 
+    /// Runs a single load test against the target, outside of any benchmark: nothing is written
+    /// to disk or printed. Every request of the measured phase is sent to `observer` as it
+    /// completes, which allows following the test live.
+    pub fn measure<B: Into<Bytes>, F: FnMut() -> Request<B>>(
+        &self,
+        mut routine: F,
+        observer: Option<mpsc::Sender<Sample>>,
+    ) -> Measurement {
+        assert!(!self.config.target.is_empty(), "gumo: no target address");
+        let routine = || routine().map(Into::into);
+        let record = self
+            .runtime
+            .block_on(engine::run(&self.config, routine, observer));
+        measure(record, self.config.vus_max())
+    }
+
     fn run<F: FnMut(&mut Bencher)>(&self, config: &Config, ids: Vec<String>, mut f: F) {
         let full_id = ids.join("/");
         if let Some(filter) = &self.filter
@@ -271,12 +320,7 @@ impl Criterion {
         let Some(record) = bencher.record else {
             panic!("gumo: {full_id} did not call Bencher::iter");
         };
-        let vus_max = match config.protocol {
-            Protocol::Http1 => config.connections,
-            Protocol::Http2 => config.connections * config.streams,
-        };
-
-        let measurement = measure(record, vus_max);
+        let measurement = measure(record, config.vus_max());
         let summary =
             serde_json::to_value(&measurement).expect("gumo: cannot serialize the summary");
         write_json(&new.join("summary.json"), &summary);
