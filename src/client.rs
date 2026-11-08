@@ -1,4 +1,7 @@
 //! Connection handling: connects to the target and sends single requests.
+//!
+//! On Linux, sockets run on io_uring (see [`crate::uring`]) unless the kernel does not allow it;
+//! elsewhere, and as the fallback, they run on tokio's readiness-based sockets.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,9 +30,13 @@ pub(crate) struct Target {
     port: u16,
     base_path: String,
     tls: Option<TlsConnector>,
+    /// The ring that connections use, if io_uring is available.
+    #[cfg(target_os = "linux")]
+    uring: Option<Arc<crate::uring::Driver>>,
 }
 
 impl Target {
+    /// Must be called within a tokio runtime, which drives the connections' io_uring.
     pub(crate) fn new(target: &str, protocol: Protocol) -> Self {
         let uri: Uri = target
             .parse()
@@ -72,6 +79,8 @@ impl Target {
             port,
             base_path: uri.path().trim_end_matches('/').to_string(),
             tls,
+            #[cfg(target_os = "linux")]
+            uring: crate::uring::Driver::new().ok(),
         }
     }
 
@@ -107,10 +116,25 @@ impl Target {
     }
 
     async fn connect(&self) -> Result<Sender, String> {
+        #[cfg(target_os = "linux")]
+        if let Some(uring) = &self.uring {
+            let tcp = crate::uring::TcpStream::connect(uring, &self.host, self.port)
+                .await
+                .map_err(|e| format!("connect: {e}"))?;
+            return self.secure(tcp).await;
+        }
         let tcp = TcpStream::connect((self.host.as_str(), self.port))
             .await
             .map_err(|e| format!("connect: {e}"))?;
         tcp.set_nodelay(true).map_err(|e| format!("connect: {e}"))?;
+        self.secure(tcp).await
+    }
+
+    /// Wraps a connected socket in TLS if the target asks for it.
+    async fn secure<IO>(&self, tcp: IO) -> Result<Sender, String>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         match &self.tls {
             None => self.handshake(tcp).await,
             Some(tls) => {

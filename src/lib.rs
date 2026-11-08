@@ -15,6 +15,8 @@ pub use http;
 
 mod client;
 mod engine;
+#[cfg(target_os = "linux")]
+mod uring;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Protocol {
