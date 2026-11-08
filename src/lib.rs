@@ -30,9 +30,22 @@ pub struct Stage {
 
 #[derive(Clone, Debug, Serialize)]
 pub enum Load {
-    ConstantVus { duration: Duration },
-    ConstantArrivalRate { rate: f64, duration: Duration },
-    RampingArrivalRate { start_rate: f64, stages: Vec<Stage> },
+    ConstantVus {
+        duration: Duration,
+    },
+    ConstantArrivalRate {
+        rate: f64,
+        duration: Duration,
+    },
+    RampingArrivalRate {
+        start_rate: f64,
+        stages: Vec<Stage>,
+    },
+    /// Every virtual user sends its next request as soon as the last one finished, until
+    /// `iterations` requests were sent in total.
+    SharedIterations {
+        iterations: u64,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -203,15 +216,37 @@ impl Default for Criterion {
             },
             filter: None,
             output_directory: cargo_target_directory().join("gumo"),
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("gumo: cannot build the tokio runtime"),
+            runtime: runtime(0),
         }
     }
 }
 
+/// Builds the runtime that generates load: `threads` worker threads, the calling thread only
+/// if `threads` is 1, or one worker per core if `threads` is 0.
+fn runtime(threads: usize) -> tokio::runtime::Runtime {
+    let mut builder = match threads {
+        0 => tokio::runtime::Builder::new_multi_thread(),
+        1 => tokio::runtime::Builder::new_current_thread(),
+        threads => {
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder.worker_threads(threads);
+            builder
+        }
+    };
+    builder
+        .enable_all()
+        .build()
+        .expect("gumo: cannot build the tokio runtime")
+}
+
 impl Criterion {
+    /// Number of threads that generate load. `1` runs everything on the calling thread; the
+    /// default, `0`, uses one thread per core.
+    pub fn threads(mut self, threads: usize) -> Self {
+        self.runtime = runtime(threads);
+        self
+    }
+
     pub fn configure_from_args(mut self) -> Self {
         self.filter = std::env::args().skip(1).find(|arg| !arg.starts_with('-'));
         self

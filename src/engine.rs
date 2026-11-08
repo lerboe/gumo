@@ -50,6 +50,8 @@ enum Phase {
     Closed,
     /// Requests arrive on a schedule, independent of how fast they complete.
     Open(Vec<Ramp>),
+    /// Like `Closed`, but ends once this many requests were sent instead of at a deadline.
+    Iterations(u64),
 }
 
 /// A linear change of the arrival rate (requests per second) over `duration`.
@@ -101,6 +103,8 @@ pub(crate) async fn run<F: FnMut() -> Request<Bytes>>(
                 stages.iter().map(|stage| stage.duration).sum(),
             )
         }
+        // Not bound by time: the phase ignores its duration.
+        Load::SharedIterations { iterations } => (Phase::Iterations(*iterations), Duration::ZERO),
     };
     engine.phase(phase, duration).await
 }
@@ -231,6 +235,16 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
                     _ = sleep_until(deadline) => break,
                 }
             },
+            Phase::Iterations(iterations) => {
+                let mut sent = 0;
+                while sent < iterations {
+                    while sent < iterations && self.dispatch() {
+                        sent += 1;
+                    }
+                    let done = self.recv().await;
+                    self.handle(done, &mut record);
+                }
+            }
             Phase::Open(ramps) => {
                 for offset in arrivals(ramps) {
                     let sleep = sleep_until(start + offset);

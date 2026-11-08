@@ -136,3 +136,17 @@ fn busy_virtual_users_drop_arrivals() {
     assert!((5..=15).contains(&sent), "{metrics:?}");
     assert_eq!(sent + dropped, 100, "{metrics:?}");
 }
+
+#[test]
+fn shared_iterations_send_exactly_that_many_on_one_thread() {
+    let (address, seen) = server();
+    let measurement = criterion(address)
+        .threads(1)
+        .connections(4)
+        .load(Load::SharedIterations { iterations: 1_000 })
+        .measure(|| Request::get("/").body("").unwrap(), None);
+    let metrics = measurement.metrics;
+    assert_eq!(metrics.http_reqs.count, 1_000, "{metrics:?}");
+    assert_eq!(metrics.http_req_failed.passes, 0);
+    assert_eq!(seen.paths.lock().unwrap().len(), 1_000);
+}
