@@ -216,6 +216,7 @@ impl<'a, F: FnMut() -> Request<Bytes>> Engine<'a, F> {
         self.vus[vu]
             .try_send(request)
             .expect("gumo: an idle virtual user is not ready");
+        self.observe(self.sent[vu], SampleOutcome::Sent);
         true
     }
 

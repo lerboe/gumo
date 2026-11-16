@@ -167,6 +167,8 @@ impl App {
                 while let Ok(sample) = samples.try_recv() {
                     self.curve.add(sample);
                 }
+                // No more requests are sent, so the last bucket is complete too.
+                self.curve.sent_up_to = BUCKETS;
             }
             self.curve.update();
             terminal.draw(|frame| self.render(frame))?;
@@ -254,6 +256,8 @@ struct Curve {
     buckets: Vec<Bucket>,
     /// Offset of the latest sample, i.e. how far the ramp has progressed.
     elapsed: Duration,
+    /// Buckets before this one get no more requests: a later one was sent or dropped.
+    sent_up_to: usize,
     responses: u64,
     errors: u64,
     dropped: u64,
@@ -263,6 +267,8 @@ struct Curve {
 struct Bucket {
     /// Response latencies in milliseconds.
     latencies: Vec<f64>,
+    /// Requests sent but neither answered nor failed yet.
+    in_flight: u64,
     /// Whether latencies changed since the percentiles were computed.
     dirty: bool,
     p50: f64,
@@ -276,6 +282,7 @@ impl Curve {
             duration,
             buckets: (0..BUCKETS).map(|_| Bucket::default()).collect(),
             elapsed: Duration::ZERO,
+            sent_up_to: 0,
             responses: 0,
             errors: 0,
             dropped: 0,
@@ -291,18 +298,35 @@ impl Curve {
         self.max_rate * (offset.as_secs_f64() / self.duration.as_secs_f64()).min(1.0)
     }
 
+    /// The bucket of requests sent `offset` into the test.
+    fn bucket_at(&self, offset: Duration) -> usize {
+        let index = (self.rate_at(offset) / self.max_rate * BUCKETS as f64) as usize;
+        index.min(BUCKETS - 1)
+    }
+
     fn add(&mut self, sample: Sample) {
         self.elapsed = self.elapsed.max(sample.offset);
+        let index = self.bucket_at(sample.offset);
+        let bucket = &mut self.buckets[index];
         match sample.outcome {
+            SampleOutcome::Sent => {
+                bucket.in_flight += 1;
+                self.sent_up_to = self.sent_up_to.max(index);
+            }
             SampleOutcome::Response { duration, .. } => {
                 self.responses += 1;
-                let index = (self.rate_at(sample.offset) / self.max_rate * BUCKETS as f64) as usize;
-                let bucket = &mut self.buckets[index.min(BUCKETS - 1)];
+                bucket.in_flight -= 1;
                 bucket.latencies.push(duration.as_secs_f64() * 1000.0);
                 bucket.dirty = true;
             }
-            SampleOutcome::Error(_) => self.errors += 1,
-            SampleOutcome::Dropped => self.dropped += 1,
+            SampleOutcome::Error(_) => {
+                self.errors += 1;
+                bucket.in_flight -= 1;
+            }
+            SampleOutcome::Dropped => {
+                self.dropped += 1;
+                self.sent_up_to = self.sent_up_to.max(index);
+            }
         }
     }
 
@@ -316,13 +340,15 @@ impl Curve {
         }
     }
 
-    /// One (request rate, latency) point per bucket with responses.
+    /// One (request rate, latency) point per complete bucket with responses: every request of
+    /// it was answered or failed, and no more are sent into it.
     fn points(&self, latency: impl Fn(&Bucket) -> f64) -> Vec<(f64, f64)> {
         let width = self.max_rate / BUCKETS as f64;
         self.buckets
             .iter()
             .enumerate()
-            .filter(|(_, bucket)| !bucket.latencies.is_empty())
+            .take(self.sent_up_to)
+            .filter(|(_, bucket)| bucket.in_flight == 0 && !bucket.latencies.is_empty())
             .map(|(i, bucket)| ((i as f64 + 0.5) * width, latency(bucket)))
             .collect()
     }

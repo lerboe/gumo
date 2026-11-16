@@ -1,5 +1,5 @@
 [package]
-name = "gumo-cli"
+name = "cli"
 version = "0.1.0"
 edition = "2024"
 description = "Ramps up the request rate against a URL and plots latency against throughput, live"

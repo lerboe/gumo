@@ -116,7 +116,11 @@ pub struct Measurement {
     pub errors: BTreeMap<String, u64>,
 }
 
-/// One request of the measured phase, reported live by [`Criterion::measure`].
+/// An event of one request of the measured phase, reported live by [`Criterion::measure`].
+///
+/// Every request is reported as [`SampleOutcome::Sent`], and later, with the same offset, as
+/// either [`SampleOutcome::Response`] or [`SampleOutcome::Error`]; or only as
+/// [`SampleOutcome::Dropped`]. Events arrive in the order they happened.
 #[derive(Clone, Debug)]
 pub struct Sample {
     /// When the request was sent (or, if dropped, scheduled), relative to the start of the
@@ -127,6 +131,8 @@ pub struct Sample {
 
 #[derive(Clone, Debug)]
 pub enum SampleOutcome {
+    /// The request was sent; its response or error follows.
+    Sent,
     Response {
         status: u16,
         duration: Duration,
