@@ -17,6 +17,6 @@
 terminal, the measured p50 and p99 latency against the request rate:
 
 ```sh
-cargo run --release -p gumo-cli -- http://localhost:3000/health
-cargo run --release -p gumo-cli -- --help   # --max-rate, --duration, --connections, --http2, ...
+cargo run --release -p cli -- http://localhost:3000/health
+cargo run --release -p cli -- --help   # --max-rate, --duration, --connections, --http2, ...
 ```
