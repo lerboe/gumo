@@ -1,0 +1,36 @@
+name: CI
+
+on:
+    push:
+        branches:
+            - "**"
+            - "!dependabot/**"
+    pull_request:
+        branches: [main]
+    workflow_call:
+
+jobs:
+    test:
+        name: Test [${{ matrix.rust }}, ${{ matrix.profile }}]
+        runs-on: ubuntu-24.04
+        timeout-minutes: 15
+        strategy:
+            fail-fast: false
+            matrix:
+                rust: [stable, nightly]
+                profile: [dev]
+                include:
+                    - rust: stable
+                      profile: release
+        continue-on-error: ${{ matrix.rust == 'nightly' }}
+        steps:
+            - uses: actions/checkout@v7
+            - uses: dtolnay/rust-toolchain@master
+              with:
+                  toolchain: ${{ matrix.rust }}
+                  components: rustfmt
+            - uses: Swatinem/rust-cache@v2
+            - name: Build
+              run: cargo build --profile=${{ matrix.profile }} --locked --verbose --workspace
+            - name: Run tests
+              run: cargo test --profile=${{ matrix.profile }} --locked --verbose --workspace
